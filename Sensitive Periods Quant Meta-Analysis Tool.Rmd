@@ -1,0 +1,383 @@
+---
+title: "Sensitive Periods Quant Meta-Analysis Tool"
+author: "Theresa Cheng"
+date: "3/21/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+This script is to apply permutation testing to quantitatively assess the presence of sensitive periods in a meta-analysis.
+
+Note that: 
+* Analyses do not weigh study by N
+* Some years have fewer studies contributing data (there are NAs throughout, but more NAs in late adolescence)
+* Only continuous studies whose analyses permitted the identification of specific years as sensitive periods are included
+* Sensitive period results are shuffled by randomized starting year (of available data years)
+
+```{r setup, include=FALSE} 
+
+### install packages
+if(!require(pacman)){install.packages('pacman')} # if pacman isn't installed, install it 
+library(pacman) # load pacman library
+pacman::p_load(rio, dplyr, stringr, tidyr, permute, ggplot2, install = TRUE) # pacman installs and loads other packages
+
+### variables
+working_dir <- "~/Dropbox (Partners HealthCare)/Sensitive Period Review article (Jon and Erin)/Theresa - Permutation Testing/sens_periods_maltreatment/"
+input_dir <- paste0(working_dir, "Data/")
+output_dir <- paste0(working_dir, "Results/")
+rerun_perms = TRUE # running 1000 permutations takes time, so if you don't need to re-run them, don't! they will be loaded from a saved file
+rerun_plots = TRUE # same for saving ggplots
+analysis_type = "depression" # other available types are: imaging, cognitive; note that values were rounded to the nearest whole number except as needed to differentiate between two adjacent time periods (e.g., 1.5-->1 instead of 2 when the next value was 1.6-->2 to prevent overlapping exposure periods)
+```
+
+```{r clean data}
+
+### read in test data
+df <- import(paste0(input_dir, analysis_type, "_studies.xlsx"))
+
+### Observations
+# reformat data to be in long format with each age as a 0, 1 (eventually needs an NA, as in-- the study didn't assess this time period
+ages <- 0:18
+
+for (age in ages){
+  df[, paste0("yr_", age)] <- ifelse((age >= df$sp_start1 & age <= df$sp_end1) | # if the age is contained within any of the sp_starts and ends
+                                      (age >= df$sp_start2 & age <= df$sp_end2) |
+                                       (age >= df$sp_start3 & age <= df$sp_end3) | # warning: brittle code requires manually including the right number of sp_starts/ends
+                                        (age >= df$sp_start4 & age <= df$sp_end4) | 
+                                        (age >= df$sp_start5 & age <= df$sp_end5), 
+                                     1, 0) # then assign the value 1 --> otherwise, assign the value zero
+  
+  # if the age is contained within any of the exposure_starts and ends then label it with the block number
+  df[, paste0("yr_", age, "_block")] <- ifelse((age >= df$exposure_start1 & age <= df$exposure_end1), 1,
+                                               ifelse((age >= df$exposure_start2 & age <= df$exposure_end2), 2,
+                                                      ifelse((age >= df$exposure_start3 & age <= df$exposure_end3), 3, 
+                                                             ifelse((age >= df$exposure_start4 & age <= df$exposure_end4), 4, 
+                                                                    ifelse((age >= df$exposure_start5 & age <= df$exposure_end5), 5,
+                                                                      ifelse((age >= df$exposure_start6 & age <= df$exposure_end6), 6, NA))))))
+  }
+
+# subset data to relevant obs data points
+df_obs_noID <- df %>% 
+  filter(!(sp_type == "Continuous" & include_cont_study == 0)) %>%  # remove studies with continuous age effects
+  select(starts_with("yr")) %>% 
+  select(!ends_with("block"))
+
+study_id = paste0("study_", 1:nrow(df_obs_noID))
+
+df_obs <- df_obs_noID %>% 
+  mutate(study_id = study_id)
+
+df_obs[is.na(df_obs)] <-  0
+
+# make a long version
+df_obs_long <- df_obs %>% 
+  pivot_longer(cols = -study_id, names_to = "year", values_to = "sensitive_period")
+
+## TIME PERIOD GROUPINGS 
+# subset data to relevant data points
+df_exps <- df %>% 
+  filter(!(sp_type == "Continuous" & include_cont_study == 0)) %>%  # remove studies that assessed age continuously 
+  select(starts_with("yr")) %>% 
+  select(ends_with("block")) %>% 
+  mutate(study_id = study_id)
+
+# make a long version
+df_exps_long <- df_exps %>% 
+  pivot_longer(cols = -study_id, names_to = "year", values_to = "block_num")
+
+# remove the word "block" from year
+df_exps_long$year <- str_remove(df_exps_long$year, "_block")
+
+## CONNECT OBSERVATIONS AND TIME PERIOD GROUPINGS
+df_long <- full_join(df_obs_long, df_exps_long)
+
+# if block = NA, then sensitive period effect = NA
+df_long$sensitive_period <- ifelse(is.na(df_long$block_num), NA, df_long$sensitive_period)
+
+# reconstruct and overwrite df_obs and df_exp
+df_obs <- pivot_wider(df_long, id_cols = study_id, names_from = year, values_from = sensitive_period)
+df_obs_noID <- df_obs[, !colnames(df_obs) %in% "study_id"]
+df_block_nums <- pivot_wider(df_long, id_cols = study_id, names_from = year, values_from = block_num)
+
+## KEY
+# create a key linking study id to study 
+df_key <- cbind(paste0("study_", 1:nrow(df_obs)), df$paper[!(df$sp_type == "Continuous" & df$include_cont_study == 0)])
+colnames(df_key) <- c("study_id", "paper")
+cont_study <- df %>% 
+  filter(!(sp_type == "Continuous" & include_cont_study == 0)) %>% 
+  mutate(cont_study = ifelse(sp_type == "Continuous", 1, 0)) %>% 
+  select(cont_study)
+
+df_key <- cbind(df_key, cont_study)
+
+# tidy up a bit
+rm(list = c("df_exps", "df_exps_long", "df_obs_long", "age", "cont_study")) # get rid of these
+```
+
+```{r describing the distribution}
+
+### for each age, calculate the probability of a sensitive period
+df_probs <- apply(df_obs_noID, 2, function(x) {sum(x, na.rm = T)/sum(!is.na(x))}) 
+
+### identify the fraction of positive results out of the total number of tested time points
+total_pos <- sum(df_obs_noID, na.rm = T)
+total_possible <- dim(df_obs_noID)[1]*dim(df_obs_noID)[2]
+```
+
+```{r permute the null distribution}
+
+### randomly generate perm_num (usually 1000) datasets with the same sensitive periods shuffled within study + re-calculate probability distribution
+output <- data.frame()
+
+perm_num = 1000
+
+# FOR EACH PERMUTATION
+if (rerun_perms == TRUE) {
+for(i in 1:perm_num){  
+  if(i == 1){output <- data.frame()} #empty df to save into
+    set.seed(i) #seed needs to be different every loop so that the sample changes
+    temp <- df_obs
+    
+    assemble_df_obs <- data.frame(year_num = ages, # set up the data frame
+                                  sensitive_period = numeric(length = 19)) %>% 
+      pivot_wider(names_from = year_num, values_from = sensitive_period, names_prefix = "yr_") %>% 
+      mutate(study_id = NA)
+      
+    # FOR EACH STUDY
+    for (j in 1:nrow(df_obs)){
+      this_study_id = paste0("study_", j)
+      
+      # generate block variables
+      max_block_num = max(df_block_nums[j, -1], na.rm = T)
+      block_order = 1:max_block_num
+  
+      # figure out original sensitive period order
+      temp_study <- df_long %>%   # filter data by study and relevant variables
+        filter(study_id == this_study_id) %>% 
+        select(sensitive_period, block_num) %>% 
+        mutate(year_num = 0:18)
+    
+      # create a reference for sensitive periods by block number
+      sp_block_info <- temp_study[-3]
+      sp_block_info <- temp_study[!duplicated(sp_block_info), c("sensitive_period", "block_num")] # filter duplicated information  
+    
+      # initiate a dataframe to capture shuffled observations
+      shuffled_obs <- data.frame(year_num = ages, # set up the data frame
+                                 sensitive_period = numeric(length = 19))
+      
+      # keep the same placement of NA values by removing them up front as possible shuffled observations
+      NA_years <- shuffled_obs$year_num[which(is.na(temp_study$sensitive_period))]
+      NA_df <- shuffled_obs %>% 
+        filter(year_num %in% NA_years) %>% 
+        mutate(sensitive_period = case_when(year_num %in% NA_years ~ NA))
+    
+      shuffled_obs <- shuffled_obs %>% 
+        filter(!year_num %in% NA_years)
+      
+      if (df_key$cont_study[j] == 0){ # FOR NON-CONTINUOUS STUDIES
+        
+        # two rules
+        # 1. if there is at least one sensitive period, but not all sensitive periods, shuffle the start year to permute observations
+        
+        # get block numbers of blocks with sensitive periods
+        sp_pos_block_num <- sp_block_info[(sp_block_info$sensitive_period == 1 & !is.na(sp_block_info$sensitive_period)), ]$block_num
+        
+        if (length(sp_pos_block_num) >= 1 & length(sp_pos_block_num) < nrow(sp_block_info[!is.na(sp_block_info$sensitive_period), ])) { 
+        # initiate vector for shuffled_sp_years
+        shuffled_sp_years <- as.numeric()
+          
+        # FOR EACH BLOCK THAT HAS AN EFFECT
+        for (l in length(sp_pos_block_num)){
+          # remove any shuffled sp_years from the shuffled_obs data frame, so that remaining years are "available" for SPs to be shuffled into
+          shuffled_obs <- shuffled_obs %>%
+            filter(!year_num %in% shuffled_sp_years)
+  
+          # determine sp start year
+          shuffled_sp_start_yr <- sample(shuffled_obs$year_num, 1) # select out of available start years - NA_years and shuffled sp_years already removed
+  
+          # record length of the sp in the current block num
+          length_sp = temp_study %>%
+            filter(block_num == sp_pos_block_num[l]) %>%
+            nrow()
+  
+          # shuffle sensitive period based on a randomly sampled available start year
+          if (shuffled_sp_start_yr + (length_sp - 1) <= max(shuffled_obs$year_num)){  # if you can add the shuffled sp in one continuous block, do it
+            shuffled_obs$sensitive_period <- ifelse((shuffled_obs$year_num >= shuffled_sp_start_yr & # for each available year that is > new start year
+                                                       shuffled_obs$year_num <= shuffled_sp_start_yr + (length_sp - 1)), 1, 0) # and is <= to the last sp year
+            } else if (shuffled_sp_start_yr + (length_sp - 1) > max(shuffled_obs$year_num)) { # if you can't,
+              shuffled_obs$sensitive_period <- ifelse(shuffled_obs$year_num >= shuffled_sp_start_yr, 1, shuffled_obs$sensitive_period) # fill in the end
+              snake_up_to_year <- (length_sp - 1) - sum(shuffled_obs$year_num >= shuffled_sp_start_yr)  # and snake around to the beginning
+              shuffled_obs$sensitive_period <- ifelse(shuffled_obs$year_num <= snake_up_to_year, 1, shuffled_obs$sensitive_period)
+            }
+  
+          shuffled_sp_years = unique(c(shuffled_sp_years, shuffled_obs$year_num[shuffled_obs$sensitive_period == 1])) # add to the new SP vector
+        }
+        } else {
+          # 2 if there are no sensitive periods OR if an effect is identified at every time period, then
+          # provide enough information to recreate the data frame as is; this essentially does not permute the data frame
+          NA_years = temp_study$year_num[is.na(temp_study$block_num)]
+          shuffled_sp_years = temp_study$year_num[temp_study$sensitive_period == 1 & !is.na(temp_study$sensitive_period)]
+        }
+      } else if (df_key$cont_study[j] == 1){ ## FOR CONTINUOUS STUDIES
+        
+        if (sum(temp_study$sensitive_period, na.rm = T) > 0 & # if there is at least 1 sensitive period
+            sum(temp_study$sensitive_period, na.rm = T) < nrow(temp_study[!is.na(temp_study$sensitive_period), ])) { # and not everything is a sensitive period
+          
+          # then shuffle sp years
+          shuffled_sp_years <- as.numeric()
+        
+          ## FOR EACH SP EFFECT 
+          for (l in 1:sum(temp_study$sensitive_period, na.rm = T)){
+            
+            # remove any years with a new SP effect
+            shuffled_obs <- shuffled_obs %>%
+              filter(!year_num %in% shuffled_sp_years)
+            
+            # shuffle a new start year from the available years
+             shuffled_sp_start_yr <- sample(shuffled_obs$year_num, 1)
+            
+             # add record the shuffled start year
+             shuffled_sp_years = unique(c(shuffled_sp_years, shuffled_sp_start_yr))
+             } 
+        } else {
+          # 2 if there are no sensitive periods OR if an effect is identified at every time period, then
+          # provide enough information to recreate the data frame as is; this essentially does not permute the data frame
+          NA_years = temp_study$year_num[is.na(temp_study$sensitive_period)]
+          shuffled_sp_years = temp_study$year_num[temp_study$sensitive_period & !is.na(temp_study$sensitive_period)]
+        }
+      }
+      
+    # re-assemble shuffled data frame based on NA_yrs and sp_yrs
+    assemble_shuffled_study_obs <- data.frame(year_num = ages, # set up the data frame
+                               sensitive_period = numeric(length = 19))
+
+    assemble_shuffled_study_obs$sensitive_period <- ifelse(assemble_shuffled_study_obs$year_num %in% NA_years, NA, assemble_shuffled_study_obs$sensitive_period)
+    assemble_shuffled_study_obs$sensitive_period <- ifelse(assemble_shuffled_study_obs$year_num %in% shuffled_sp_years, 1, assemble_shuffled_study_obs$sensitive_period)
+
+    assemble_shuffled_study_obs_wide <- pivot_wider(assemble_shuffled_study_obs, names_from = year_num, values_from = sensitive_period, names_prefix = "yr_") %>%
+      mutate(study_id = study_id[j])
+
+    assemble_df_obs <- rbind(assemble_df_obs, assemble_shuffled_study_obs_wide)
+      }
+    
+    assemble_df_obs <- assemble_df_obs %>% 
+      filter(!is.na(study_id))
+      
+    # then do group stats on the dataframe (see below), but before this figure out the average block length (use number of repetitions in dataframe?)
+    output <- c(output, apply(assemble_df_obs[, !colnames(assemble_df_obs) %in% "study_id"], 2, function(x) {sum(x, na.rm = T)/sum(!is.na(x))})) 
+}
+
+output_df <- as.data.frame(unlist(output)) %>% 
+  mutate(year_num = rep(paste0("yr_", 0:18), perm_num))
+
+colnames(output_df)[1] <- "permuted_prob"
+
+saveRDS(output_df, file = paste0(output_dir, analysis_type, "/permuted_values_", analysis_type, ".rds"))
+
+} else if (rerun_perms == FALSE){
+  output_df <- readRDS(paste0(output_dir, analysis_type, "/permuted_values_", analysis_type, ".rds"))
+}
+```
+
+# One-sided p-values
+```{r generate results}
+
+p_val_per_yr <- data.frame(year = paste0("yr_", ages), 
+                           p_vals = NA)
+
+for (year_num in ages){
+  year <- paste0("yr_", year_num) # define the year
+  
+  # determine the p-value for each year
+  observed_prob <- df_probs[year_num + 1] # indicate the observed probability
+  this_yrs_output <- output_df %>% # filter to all of the year 18 observations
+    filter(year_num == year)
+  p_val <- sum(this_yrs_output$permuted_prob >= observed_prob)/perm_num # determine the proportion of permuted values that are greater than or equal to the observed value
+  p_val_per_yr$p_vals[year_num + 1] <- round(p_val, 3) # save this value in a dataframe 
+    
+  if (rerun_plots == TRUE){
+      # save a ggplot of the permuted distribution for each year
+    perm_dist <- ggplot(this_yrs_output, aes(x = permuted_prob)) + 
+    geom_histogram(binwidth = .1) + # another brittle, manually adjusted bit
+    geom_vline(xintercept = observed_prob, color = "red", linetype = "dotted", size = 1) + 
+    annotate(geom="text", x=observed_prob+.04, y=200, label=paste0("p = ", p_val),
+              color="red") +
+      xlab("Probability") + 
+      ylab("Count")
+  
+    ggsave(paste0(output_dir, analysis_type, "/perm_dist_yr", year_num, ".png"))
+    }
+}
+
+write.csv(p_val_per_yr, file = paste0(output_dir, analysis_type, "/pvals_", analysis_type, ".csv"))
+
+# Run and save other analyses
+```
+
+# Example simulation code
+```{r permutation example, eval = FALSE}
+# #making some random data! 
+# df <- data.frame(sample =1:100, dat=rnorm(n=100), dat2 = rnorm(n=100))
+# head(df)
+# 
+# #the permutation loop
+# for(i in 1:100){
+#   if(i ==1){output <- data.frame()} #empty df to save into
+#   if(i %% 10 == 0){print(i)} #print out every 10
+#   set.seed(i) #seed needs to be different every loop so that the sample changes
+#   temp <- df 
+#   temp$dat <- df$dat[sample(1:100)] #want to break the relationship between dat and dat2 because of the lm function
+#   output <- c(output, coef(lm(temp$dat ~ temp$dat2))[2]) #we want to determine whether the coef is lower than change
+# }
+# output <- unlist(output) 
+# ground <- coef(lm(df$dat ~ df$dat2))[2] #the ground truth - unpermuted
+# summary(lm(df$dat ~ df$dat2)) #p=0.61
+# 
+# #p-values - one sided 
+# sum(output <= ground) #26/100 -> p=0.26 for 1ower than random chance
+# sum(output >= ground) #74/100 -> p=0.74 for being higher than random chance
+# 
+# #p-value - two sided
+# sum(abs(output)>= abs(ground)) /length(output) #p=0.57, not so far from the lm p.value
+# 
+# 
+# df_probs_pvals <- unlist(lapply(df_probs, function(x) {round(sum(output_df$permuted_prob >= x)/length(output_df$permuted_prob), 3)}))
+# df_probs_pvals
+# ```
+# 
+# ```{r probs to delete, eval = F}
+#       # # if there is one sensitive period, shuffle the start year by keeping the length consistent. keep the total number of 0s, NAs, and 1s consistent
+#       # if (sum(sp_block_info$sensitive_period, na.rm = T) == 1 & sum(sp_block_info$sensitive_period, na.rm = T) < nrow(sp_block_info)){
+#       # 
+#       # # determine shuffled sensitive period start year and duration
+#       # shuffled_sp_start_yr <- sample(shuffled_obs$year_num, 1)
+#       # length_sp <- sum(temp_study$sensitive_period == 1, na.rm = T)
+#       # 
+#       # # shuffle observations based on a roving start year
+#       # if (shuffled_sp_start_yr + length_sp <= nrow(shuffled_obs)){ 
+#       #   # if there's enough room to add the sensitive period in one continuous block, use start year + length to replace 
+#       #   shuffled_obs$sensitive_period <- ifelse((shuffled_obs$year_num >= shuffled_sp_start_yr & shuffled_obs$year_num <= shuffled_sp_start_yr + length_sp), 1, 0)
+#       #   
+#       # } else if (shuffled_sp_start_yr + length_sp > nrow(shuffled_obs)) {
+#       #   # if there isn't enough room
+#       #   # fill in the end
+#       #   shuffled_obs$sensitive_period <- ifelse((shuffled_obs$year_num >= shuffled_sp_start_yr), 1, 0)
+#       #   
+#       #   #snake around to the beginning
+#       #   snake_up_to <- length_sp - sum(shuffled_obs$year_num >= shuffled_sp_start_yr)
+#       #   shuffled_obs$sensitive_period[1:snake_up_to] <- 1
+#       #   
+#       #   # add back in the NA values at the same location
+#       #   shuffled_obs <- rbind(shuffled_obs, NA_df)}
+#       # }
+# 
+# 
+# # figure out pvalue associated with ground extreme
+# ground_extreme <-  max(df_probs)
+# pval_assoc_w_ground_extreme <- round(sum(output$permuted_prob >= ground_extreme)/length(output$permuted_prob), 3) # 117/1900 = .06
+# 
+# ggplot(output, aes(x = permuted_prob)) + 
+#   geom_histogram(binwidth = 0.04) +
+#   geom_vline(xintercept = ground_extreme, color = "red", linetype = "dotted", size = 1)
+```
